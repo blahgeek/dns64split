@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import typing
 import asyncio
 
 import geoip2.database
@@ -97,11 +96,9 @@ class Protocol(asyncio.DatagramProtocol):
         self._server = server
         self._transport: asyncio.transports.DatagramTransport | None = None
 
-    @typing.override
     def connection_made(self, transport: asyncio.transports.DatagramTransport):
         self._transport = transport
 
-    @typing.override
     def datagram_received(self, data, addr):
         async def _handle():
             if not self._transport:
