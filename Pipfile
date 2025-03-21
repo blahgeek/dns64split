@@ -5,6 +5,7 @@ name = "pypi"
 
 [packages]
 dnspython = "*"
+geoip2 = "*"
 
 [dev-packages]
 
