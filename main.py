@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+import os
 import asyncio
 
 import geoip2.database
+import dns.name
 import dns.message
 import dns.rdatatype
 import dns.rdataclass
@@ -13,21 +15,36 @@ import dns.rdtypes.IN.AAAA
 import dns.asyncquery
 
 
+_GEOLITE2_COUNTRY_DB_PATH = os.path.join(os.path.dirname(__file__), 'data/GeoLite2-Country.mmdb')
+_CHINA_DOMAIN_LIST_PATH = os.path.join(os.path.dirname(__file__), 'data/china-domain-list.txt')
+
+_GLOBAL_UPSTREAM = '8.8.8.8'
+_CN_UPSTREAM = '114.114.114.114'
+
 class Server:
-    def __init__(self, *,
-                 upstream: str,
-                 dns64_prefix: str,
-                 geolite2_db_path: str = 'GeoLite2-Country.mmdb'):
-        self._upstream = upstream
-        self._geoip_db = geoip2.database.Reader(geolite2_db_path)
+    def __init__(self, *, dns64_prefix: str):
+        self._geoip_db = geoip2.database.Reader(_GEOLITE2_COUNTRY_DB_PATH)
         self._dns64_prefix = dns64_prefix
         assert self._dns64_prefix.endswith(':')
+
+        with open(_CHINA_DOMAIN_LIST_PATH) as f:
+            self._china_domain_list = set(line.strip() for line in f.readlines() if line.strip())
+
+    def _is_cn_domain(self, name: dns.name.Name) -> bool:
+        labels = [x.decode().lower() for x in name.labels if x]
+        if labels and labels[-1] == 'cn':
+            return True
+        for i in range(1, len(labels)):
+            suffix = '.'.join(labels[-i:])
+            if suffix in self._china_domain_list:
+                return True
+        return False
 
     def _is_cn_ip(self, ip: str) -> bool:
         res = self._geoip_db.country(ip)
         return res.country.iso_code == 'CN'
 
-    def _is_cn_answer(self, answer: list[dns.rrset.RRset]) -> bool:
+    def _is_cn_ip_answer(self, answer: list[dns.rrset.RRset]) -> bool:
         for ans in answer:
             if ans.rdclass == dns.rdataclass.IN \
                and ans.rdtype in (dns.rdatatype.A, dns.rdatatype.AAAA) \
@@ -41,23 +58,26 @@ class Server:
         '''
         resp = await dns.asyncquery.udp(
             dns.message.make_query(question.name, dns.rdatatype.A),
-            self._upstream,
+            _CN_UPSTREAM if self._is_cn_domain(question.name) else _GLOBAL_UPSTREAM,
         )
-        return resp.answer if self._is_cn_answer(resp.answer) else []
+        return resp.answer if self._is_cn_ip_answer(resp.answer) else []
 
     async def _handle_query_aaaa(self, question: dns.rrset.RRset) -> list[dns.rrset.RRset]:
+        if self._is_cn_domain(question.name):
+            return []
+
         a_resp, aaaa_resp = await asyncio.gather(
             dns.asyncquery.udp(
                 dns.message.make_query(question.name, dns.rdatatype.A),
-                self._upstream,
+                _GLOBAL_UPSTREAM,
             ),
             dns.asyncquery.udp(
                 dns.message.make_query(question.name, dns.rdatatype.AAAA),
-                self._upstream,
+                _GLOBAL_UPSTREAM,
             ),
         )
 
-        if self._is_cn_answer(aaaa_resp.answer) or self._is_cn_answer(a_resp.answer):
+        if self._is_cn_ip_answer(a_resp.answer):
             return []
 
         if aaaa_resp.get_rrset(dns.message.ANSWER, question.name, dns.rdataclass.IN, dns.rdatatype.AAAA):
@@ -81,7 +101,7 @@ class Server:
         question = request.question[0]
         if question.rdtype not in (dns.rdatatype.A, dns.rdatatype.AAAA) or \
            question.rdclass != dns.rdataclass.IN:
-            return await dns.asyncquery.udp(request, self._upstream)
+            return await dns.asyncquery.udp(request, _GLOBAL_UPSTREAM)
 
         response = dns.message.make_response(request, recursion_available=True)
         response.answer = await (
@@ -123,14 +143,8 @@ if __name__ == '__main__':
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--port', type=int, default=53)
-    parser.add_argument('--upstream', type=str, default='8.8.8.8')
     parser.add_argument('--dns64-prefix', type=str, default='64:ff9b::')
-    parser.add_argument('--geolite2-db-path', type=str, default='GeoLite2-Country.mmdb')
     args = parser.parse_args()
 
-    server = Server(
-        upstream=args.upstream,
-        dns64_prefix=args.dns64_prefix,
-        geolite2_db_path=args.geolite2_db_path,
-    )
+    server = Server(dns64_prefix=args.dns64_prefix)
     run_forever(server, args.port)
