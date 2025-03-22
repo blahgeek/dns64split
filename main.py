@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+import functools
 import os
 import asyncio
 import logging
@@ -26,14 +27,20 @@ _CN_UPSTREAM = '114.114.114.114'
 logger = logging.getLogger('dns64split')
 
 
+@functools.cache
+def get_china_domain_list() -> set[str]:
+    with open(_CHINA_DOMAIN_LIST_PATH) as f:
+        return set(line.strip() for line in f.readlines() if line.strip())
+
+@functools.cache
+def get_geoip2_db() -> geoip2.database.Reader:
+    return geoip2.database.Reader(_GEOLITE2_COUNTRY_DB_PATH)
+
+
 class Server:
     def __init__(self, *, dns64_prefix: str):
-        self._geoip_db = geoip2.database.Reader(_GEOLITE2_COUNTRY_DB_PATH)
         self._dns64_prefix = dns64_prefix
         assert self._dns64_prefix.endswith(':')
-
-        with open(_CHINA_DOMAIN_LIST_PATH) as f:
-            self._china_domain_list = set(line.strip() for line in f.readlines() if line.strip())
 
     def _is_cn_domain(self, name: dns.name.Name) -> bool:
         labels = [x.decode().lower() for x in name.labels if x]
@@ -41,12 +48,12 @@ class Server:
             return True
         for i in range(1, len(labels)+1):
             suffix = '.'.join(labels[-i:])
-            if suffix in self._china_domain_list:
+            if suffix in get_china_domain_list():
                 return True
         return False
 
     def _is_cn_ip(self, ip: str) -> bool:
-        res = self._geoip_db.country(ip)
+        res = get_geoip2_db().country(ip)
         return res.country.iso_code == 'CN'
 
     def _is_cn_ip_answer(self, answer: list[dns.rrset.RRset]) -> bool:
