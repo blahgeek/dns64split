@@ -3,6 +3,7 @@
 
 import os
 import asyncio
+import logging
 
 import geoip2.database
 import dns.name
@@ -21,6 +22,10 @@ _CHINA_DOMAIN_LIST_PATH = os.path.join(os.path.dirname(__file__), 'data/china-do
 _GLOBAL_UPSTREAM = '8.8.8.8'
 _CN_UPSTREAM = '114.114.114.114'
 
+
+logger = logging.getLogger('dns64split')
+
+
 class Server:
     def __init__(self, *, dns64_prefix: str):
         self._geoip_db = geoip2.database.Reader(_GEOLITE2_COUNTRY_DB_PATH)
@@ -34,7 +39,7 @@ class Server:
         labels = [x.decode().lower() for x in name.labels if x]
         if labels and labels[-1] == 'cn':
             return True
-        for i in range(1, len(labels)):
+        for i in range(1, len(labels)+1):
             suffix = '.'.join(labels[-i:])
             if suffix in self._china_domain_list:
                 return True
@@ -99,6 +104,7 @@ class Server:
 
     async def handle_query(self, request: dns.message.Message) -> dns.message.Message:
         question = request.question[0]
+        logger.debug(f'Handling question {question}, is cn domain? {self._is_cn_domain(question.name)}')
         if question.rdtype not in (dns.rdatatype.A, dns.rdatatype.AAAA) or \
            question.rdclass != dns.rdataclass.IN:
             return await dns.asyncquery.udp(request, _GLOBAL_UPSTREAM)
@@ -144,7 +150,11 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--port', type=int, default=53)
     parser.add_argument('--dns64-prefix', type=str, default='64:ff9b::')
+    parser.add_argument('--verbose', '-v', action='store_true', help='Increase verbosity')
     args = parser.parse_args()
+
+    if args.verbose:
+        logging.basicConfig(level=logging.DEBUG)
 
     server = Server(dns64_prefix=args.dns64_prefix)
     run_forever(server, args.port)
