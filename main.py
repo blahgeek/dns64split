@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+import collections
+import enum
 import functools
 import os
 import asyncio
@@ -27,10 +29,35 @@ _CN_UPSTREAM = '114.114.114.114'
 logger = logging.getLogger('dns64split')
 
 
-@functools.cache
-def get_china_domain_list() -> set[str]:
+class DomainPolicy(enum.Flag):
+    CN_DOMAIN = enum.auto()
+    IGNORE_NATIVE_IPV6 = enum.auto()
+
+
+def _parse_domain_policies_from_config(config_path: str | None) -> dict[str, DomainPolicy]:
+    result = collections.defaultdict(lambda: DomainPolicy(0))
+    # 1. special china domain list file
+    result['cn'] |= DomainPolicy.CN_DOMAIN  # ".cn"
     with open(_CHINA_DOMAIN_LIST_PATH) as f:
-        return set(line.strip() for line in f.readlines() if line.strip())
+        logger.info(f'Reading china domain list from {_CHINA_DOMAIN_LIST_PATH}')
+        for line in f.readlines():
+            line = line.strip()
+            if line:
+                result[line] |= DomainPolicy.CN_DOMAIN
+    # 2. config file
+    # each line format:
+    # <domain>:<policy1>,<policy2>
+    if config_path and os.path.exists(config_path):
+        logger.info(f'Reading config from {config_path}')
+        with open(config_path) as f:
+            for line in f.readlines():
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue
+                domain, _, policies = line.partition(':')
+                for policy in policies.split(','):
+                    result[domain] |= getattr(DomainPolicy, policy.upper())
+    return dict(result)
 
 @functools.cache
 def get_geoip2_db() -> geoip2.database.Reader:
@@ -38,19 +65,18 @@ def get_geoip2_db() -> geoip2.database.Reader:
 
 
 class Server:
-    def __init__(self, *, dns64_prefix: str):
+    def __init__(self, *, dns64_prefix: str, config_path: str | None):
+        self._domain_policies = _parse_domain_policies_from_config(config_path)
         self._dns64_prefix = dns64_prefix
         assert self._dns64_prefix.endswith(':')
 
-    def _is_cn_domain(self, name: dns.name.Name) -> bool:
+    def _get_domain_policy(self, name: dns.name.Name) -> DomainPolicy:
         labels = [x.decode().lower() for x in name.labels if x]
-        if labels and labels[-1] == 'cn':
-            return True
         for i in range(1, len(labels)+1):
             suffix = '.'.join(labels[-i:])
-            if suffix in get_china_domain_list():
-                return True
-        return False
+            if res := self._domain_policies.get(suffix):
+                return res
+        return DomainPolicy(0)
 
     def _is_cn_ip(self, ip: str) -> bool:
         res = get_geoip2_db().country(ip)
@@ -68,14 +94,16 @@ class Server:
         '''
         Return A response as-is only if it's from CN
         '''
+        policy = self._get_domain_policy(question.name)
         resp = await dns.asyncquery.udp(
             dns.message.make_query(question.name, dns.rdatatype.A),
-            _CN_UPSTREAM if self._is_cn_domain(question.name) else _GLOBAL_UPSTREAM,
+            _CN_UPSTREAM if DomainPolicy.CN_DOMAIN in policy else _GLOBAL_UPSTREAM,
         )
         return resp.answer if self._is_cn_ip_answer(resp.answer) else []
 
     async def _handle_query_aaaa(self, question: dns.rrset.RRset) -> list[dns.rrset.RRset]:
-        if self._is_cn_domain(question.name):
+        policy = self._get_domain_policy(question.name)
+        if DomainPolicy.CN_DOMAIN in policy:
             return []
 
         a_resp, aaaa_resp = await asyncio.gather(
@@ -92,7 +120,8 @@ class Server:
         if self._is_cn_ip_answer(a_resp.answer):
             return []
 
-        if aaaa_resp.get_rrset(dns.message.ANSWER, question.name, dns.rdataclass.IN, dns.rdatatype.AAAA):
+        if DomainPolicy.IGNORE_NATIVE_IPV6 not in policy and \
+           aaaa_resp.get_rrset(dns.message.ANSWER, question.name, dns.rdataclass.IN, dns.rdatatype.AAAA):
             return aaaa_resp.answer
 
         result: list[dns.rrset.RRset] = []
@@ -111,7 +140,7 @@ class Server:
 
     async def handle_query(self, request: dns.message.Message) -> dns.message.Message:
         question = request.question[0]
-        logger.debug(f'Handling question {question}, is cn domain? {self._is_cn_domain(question.name)}')
+        logger.debug(f'Handling question {question}, domain policy {self._get_domain_policy(question.name)}')
         if question.rdtype not in (dns.rdatatype.A, dns.rdatatype.AAAA) or \
            question.rdclass != dns.rdataclass.IN:
             return await dns.asyncquery.udp(request, _GLOBAL_UPSTREAM)
@@ -156,12 +185,14 @@ if __name__ == '__main__':
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--port', type=int, default=53)
+    parser.add_argument('--config')
     parser.add_argument('--dns64-prefix', type=str, default='64:ff9b::')
     parser.add_argument('--verbose', '-v', action='store_true', help='Increase verbosity')
     args = parser.parse_args()
 
+    logging.basicConfig(level=logging.INFO)
     if args.verbose:
         logging.basicConfig(level=logging.DEBUG)
 
-    server = Server(dns64_prefix=args.dns64_prefix)
+    server = Server(dns64_prefix=args.dns64_prefix, config_path=args.config)
     run_forever(server, args.port)
