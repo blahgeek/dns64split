@@ -26,8 +26,6 @@ _CHINA_DOMAIN_LIST_PATH = os.path.join(os.path.dirname(__file__), 'data/china-do
 _GLOBAL_UPSTREAM = '8.8.8.8'
 _CN_UPSTREAM = '114.114.114.114'
 
-_UPSTREAM_QUERY_TIMEOUT = 5.0
-
 
 logger = logging.getLogger('dns64split')
 
@@ -81,16 +79,6 @@ class Server:
                 return res
         return DomainPolicy(0)
 
-    async def _query_upstream(self,
-                              name: dns.name.Name,
-                              rdtype: dns.rdatatype.RdataType,
-                              upstream: str) -> dns.message.Message:
-        return await dns.asyncquery.udp(
-            dns.message.make_query(name, rdtype),
-            upstream,
-            timeout=_UPSTREAM_QUERY_TIMEOUT,
-        )
-
     def _is_cn_ip(self, ip: str) -> bool:
         try:
             res = get_geoip2_db().country(ip)
@@ -111,9 +99,10 @@ class Server:
         Return A response as-is only if it's from CN
         '''
         policy = self._get_domain_policy(question.name)
-        resp = await self._query_upstream(
-            question.name, dns.rdatatype.A,
-            _CN_UPSTREAM if DomainPolicy.CN_DOMAIN in policy else _GLOBAL_UPSTREAM)
+        resp = await dns.asyncquery.udp(
+            dns.message.make_query(question.name, dns.rdatatype.A),
+            _CN_UPSTREAM if DomainPolicy.CN_DOMAIN in policy else _GLOBAL_UPSTREAM,
+        )
         return resp.answer if self._is_cn_ip_answer(resp.answer) else []
 
     async def _handle_query_aaaa(self, question: dns.rrset.RRset) -> list[dns.rrset.RRset]:
@@ -122,8 +111,14 @@ class Server:
             return []
 
         a_resp, aaaa_resp = await asyncio.gather(
-            self._query_upstream(question.name, dns.rdatatype.A, _GLOBAL_UPSTREAM),
-            self._query_upstream(question.name, dns.rdatatype.AAAA, _GLOBAL_UPSTREAM),
+            dns.asyncquery.udp(
+                dns.message.make_query(question.name, dns.rdatatype.A),
+                _GLOBAL_UPSTREAM,
+            ),
+            dns.asyncquery.udp(
+                dns.message.make_query(question.name, dns.rdatatype.AAAA),
+                _GLOBAL_UPSTREAM,
+            ),
         )
 
         if self._is_cn_ip_answer(a_resp.answer):
