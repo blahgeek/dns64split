@@ -9,6 +9,7 @@ import asyncio
 import logging
 
 import geoip2.database
+import geoip2.errors
 import dns.name
 import dns.message
 import dns.rdatatype
@@ -79,8 +80,11 @@ class Server:
         return DomainPolicy(0)
 
     def _is_cn_ip(self, ip: str) -> bool:
-        res = get_geoip2_db().country(ip)
-        return res.country.iso_code == 'CN'
+        try:
+            res = get_geoip2_db().country(ip)
+            return res.country.iso_code == 'CN'
+        except geoip2.errors.AddressNotFoundError:
+            return False
 
     def _is_cn_ip_answer(self, answer: list[dns.rrset.RRset]) -> bool:
         for ans in answer:
