@@ -16,6 +16,7 @@ import dns.rdatatype
 import dns.rdataclass
 import dns.query
 import dns.rrset
+import dns.rcode
 import dns.rdtypes.IN.AAAA
 import dns.asyncquery
 
@@ -26,6 +27,7 @@ _CHINA_DOMAIN_LIST_PATH = os.path.join(os.path.dirname(__file__), 'data/china-do
 _GLOBAL_UPSTREAM = '8.8.8.8'
 _CN_UPSTREAM = '114.114.114.114'
 
+_SERVER_TIMEOUT = 5.0
 
 logger = logging.getLogger('dns64split')
 
@@ -142,7 +144,7 @@ class Server:
                 result.append(ans)
         return result
 
-    async def handle_query(self, request: dns.message.Message) -> dns.message.Message:
+    async def _handle_query(self, request: dns.message.Message) -> dns.message.Message:
         question = request.question[0]
         logger.debug(f'Handling question {question}, domain policy {self._get_domain_policy(question.name)}')
         if question.rdtype not in (dns.rdatatype.A, dns.rdatatype.AAAA) or \
@@ -155,6 +157,15 @@ class Server:
             else self._handle_query_aaaa(question)
         )
         return response
+
+    async def handle_query(self, request: dns.message.Message) -> dns.message.Message:
+        try:
+            async with asyncio.timeout(_SERVER_TIMEOUT):
+                return await self._handle_query(request)
+        except TimeoutError:
+            response = dns.message.make_response(request, recursion_available=True)
+            response.set_rcode(dns.rcode.SERVFAIL)
+            return response
 
 
 class Protocol(asyncio.DatagramProtocol):
