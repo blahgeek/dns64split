@@ -161,6 +161,7 @@ class Server:
     async def handle_query(self, request: dns.message.Message) -> dns.message.Message:
         try:
             async with asyncio.timeout(_SERVER_TIMEOUT):
+                # note: on timeout, internal tasks would be cancelled, so they will not keep sockets (from asyncquery.udp) forever
                 return await self._handle_query(request)
         except TimeoutError:
             response = dns.message.make_response(request, recursion_available=True)
