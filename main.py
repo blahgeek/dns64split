@@ -24,7 +24,10 @@ import dns.asyncquery
 _GEOLITE2_COUNTRY_DB_PATH = os.path.join(os.path.dirname(__file__), 'data/GeoLite2-Country.mmdb')
 _CHINA_DOMAIN_LIST_PATH = os.path.join(os.path.dirname(__file__), 'data/china-domain-list.txt')
 
-_GLOBAL_UPSTREAM = '2001:4860:4860::8888'
+# use one.one.one.one because it does not use edns-client-subnet,
+# which means that our ipv6 source (yikai-net) does not affect the result of the geo-resolve.
+# e.g. using google ipv6 public dns service, google.com would point to an IP in Australia
+_GLOBAL_UPSTREAM = '2606:4700:4700::1111'
 _CN_UPSTREAM = '114.114.114.114'
 
 _SERVER_TIMEOUT = 5.0
