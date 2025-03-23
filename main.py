@@ -24,7 +24,7 @@ import dns.asyncquery
 _GEOLITE2_COUNTRY_DB_PATH = os.path.join(os.path.dirname(__file__), 'data/GeoLite2-Country.mmdb')
 _CHINA_DOMAIN_LIST_PATH = os.path.join(os.path.dirname(__file__), 'data/china-domain-list.txt')
 
-_GLOBAL_UPSTREAM = '8.8.8.8'
+_GLOBAL_UPSTREAM = '2001:4860:4860::8888'
 _CN_UPSTREAM = '114.114.114.114'
 
 _SERVER_TIMEOUT = 5.0
