@@ -108,7 +108,7 @@ class Server:
             dns.message.make_query(question.name, dns.rdatatype.A),
             _CN_UPSTREAM if DomainPolicy.CN_DOMAIN in policy else _GLOBAL_UPSTREAM,
         )
-        return resp.answer if self._is_cn_ip_answer(resp.answer) else []
+        return resp.answer if DomainPolicy.CN_DOMAIN in policy or self._is_cn_ip_answer(resp.answer) else []
 
     async def _handle_query_aaaa(self, question: dns.rrset.RRset) -> list[dns.rrset.RRset]:
         policy = self._get_domain_policy(question.name)
