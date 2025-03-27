@@ -137,12 +137,12 @@ class Server:
         result: list[dns.rrset.RRset] = []
         for ans in a_resp.answer:
             if ans.rdclass == dns.rdataclass.IN and ans.rdtype == dns.rdatatype.A:
-                dns64_ans = dns.rrset.RRset(ans.name, dns.rdataclass.IN, dns.rdatatype.AAAA)
-                for data in ans:
-                    dns64_ans.add(dns.rdtypes.IN.AAAA.AAAA(
+                dns64_ans = dns.rrset.from_rdata_list(
+                    ans.name, ans.ttl,
+                    [dns.rdtypes.IN.AAAA.AAAA(
                         dns.rdataclass.IN, dns.rdatatype.AAAA,
                         self._dns64_prefix + data.address,
-                    ))
+                    ) for data in ans])
                 result.append(dns64_ans)
             else:
                 result.append(ans)
