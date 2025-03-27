@@ -191,13 +191,16 @@ class Protocol(asyncio.DatagramProtocol):
         asyncio.get_running_loop().create_task(_handle())
 
 
-def run_forever(server: Server, port: int):
-    loop = asyncio.new_event_loop()
-    loop.create_task(loop.create_datagram_endpoint(
+async def main(server: Server, port: int):
+    loop = asyncio.get_event_loop()
+    transport, _ = await loop.create_datagram_endpoint(
         lambda: Protocol(server),
         local_addr=('0.0.0.0', port),
-    ))
-    loop.run_forever()
+    )
+    try:
+        await loop.create_future()
+    finally:
+        transport.close()
 
 
 if __name__ == '__main__':
@@ -215,4 +218,4 @@ if __name__ == '__main__':
         logging.basicConfig(level=logging.DEBUG)
 
     server = Server(dns64_prefix=args.dns64_prefix, config_path=args.config)
-    run_forever(server, args.port)
+    asyncio.run(main(server, args.port))
