@@ -130,7 +130,8 @@ class Server:
             return []
 
         if DomainPolicy.IGNORE_NATIVE_IPV6 not in policy and \
-           aaaa_resp.get_rrset(dns.message.ANSWER, question.name, dns.rdataclass.IN, dns.rdatatype.AAAA):
+           any(ans.rdclass == dns.rdataclass.IN and ans.rdtype == dns.rdatatype.AAAA
+               for ans in aaaa_resp.answer):
             return aaaa_resp.answer
 
         result: list[dns.rrset.RRset] = []
