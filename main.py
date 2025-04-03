@@ -24,12 +24,6 @@ import dns.asyncquery
 _GEOLITE2_COUNTRY_DB_PATH = os.path.join(os.path.dirname(__file__), 'data/GeoLite2-Country.mmdb')
 _CHINA_DOMAIN_LIST_PATH = os.path.join(os.path.dirname(__file__), 'data/china-domain-list.txt')
 
-# use one.one.one.one because it does not use edns-client-subnet,
-# which means that our ipv6 source (yikai-net) does not affect the result of the geo-resolve.
-# e.g. using google ipv6 public dns service, google.com would point to an IP in Australia
-_GLOBAL_UPSTREAM = '2606:4700:4700::1111'
-_CN_UPSTREAM = '114.114.114.114'
-
 _SERVER_TIMEOUT = 5.0
 
 logger = logging.getLogger('dns64split')
@@ -74,7 +68,13 @@ class Server:
     def __init__(self, *, dns64_prefix: str, config_path: str | None):
         self._domain_policies = _parse_domain_policies_from_config(config_path)
         self._dns64_prefix = dns64_prefix
-        assert self._dns64_prefix.endswith(':')
+        assert self._dns64_prefix.endswith('::')
+        self._cn_upstream = '114.114.114.114'
+        # 1. use nat64 ip as global upstream so that the dns server is always close to the nat64 gateway (not affected by ipv6 routes)
+        # 2. use one.one.one.one because it does not use edns-client-subnet,
+        # which means that our ipv6 source (yikai-net) does not affect the result of the geo-resolve.
+        # e.g. using google ipv6 public dns service, google.com would point to an IP in Australia
+        self._global_upstream = dns64_prefix + '1.1.1.1'
 
     def _get_domain_policy(self, name: dns.name.Name) -> DomainPolicy:
         labels = [x.decode().lower() for x in name.labels if x]
@@ -106,7 +106,7 @@ class Server:
         policy = self._get_domain_policy(question.name)
         resp = await dns.asyncquery.udp(
             dns.message.make_query(question.name, dns.rdatatype.A),
-            _CN_UPSTREAM if DomainPolicy.CN_DOMAIN in policy else _GLOBAL_UPSTREAM,
+            self._cn_upstream if DomainPolicy.CN_DOMAIN in policy else self._global_upstream,
         )
         return resp.answer if DomainPolicy.CN_DOMAIN in policy or self._is_cn_ip_answer(resp.answer) else []
 
@@ -118,11 +118,11 @@ class Server:
         a_resp, aaaa_resp = await asyncio.gather(
             dns.asyncquery.udp(
                 dns.message.make_query(question.name, dns.rdatatype.A),
-                _GLOBAL_UPSTREAM,
+                self._global_upstream,
             ),
             dns.asyncquery.udp(
                 dns.message.make_query(question.name, dns.rdatatype.AAAA),
-                _GLOBAL_UPSTREAM,
+                self._global_upstream,
             ),
         )
 
@@ -153,7 +153,7 @@ class Server:
         logger.debug(f'Handling question {question}, domain policy {self._get_domain_policy(question.name)}')
         if question.rdtype not in (dns.rdatatype.A, dns.rdatatype.AAAA) or \
            question.rdclass != dns.rdataclass.IN:
-            return await dns.asyncquery.udp(request, _GLOBAL_UPSTREAM)
+            return await dns.asyncquery.udp(request, self._global_upstream)
 
         response = dns.message.make_response(request, recursion_available=True)
         response.answer = await (
