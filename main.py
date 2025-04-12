@@ -14,7 +14,6 @@ import dns.name
 import dns.message
 import dns.rdatatype
 import dns.rdataclass
-import dns.query
 import dns.rrset
 import dns.rcode
 import dns.rdtypes.IN.AAAA
@@ -70,11 +69,14 @@ class Server:
         self._dns64_prefix = dns64_prefix
         assert self._dns64_prefix.endswith('::')
         self._cn_upstream = '114.114.114.114'
-        # 1. use nat64 ip as global upstream so that the dns server is always close to the nat64 gateway (not affected by ipv6 routes)
-        # 2. use one.one.one.one because it does not use edns-client-subnet,
+        # Our VPS may have different isp for v4 and v6 network (e.g. due to tunneling),
+        # so use v4 and v6 dns server for A and AAAA queries respectively.
+        # For v4 dns server, use nat64 ip so that it is always sent through the nat64 gateway (not affected by ipv6 routes)
+        # Use cloudflare because it does not use edns-client-subnet,
         # which means that our ipv6 source (yikai-net) does not affect the result of the geo-resolve.
         # e.g. using google ipv6 public dns service, google.com would point to an IP in Australia
-        self._global_upstream = dns64_prefix + '1.1.1.1'
+        self._global_upstream_v4 = dns64_prefix + '1.1.1.1'
+        self._global_upstream_v6 = '2606:4700:4700::1111'
 
     def _get_domain_policy(self, name: dns.name.Name) -> DomainPolicy:
         labels = [x.decode().lower() for x in name.labels if x]
@@ -106,7 +108,7 @@ class Server:
         policy = self._get_domain_policy(question.name)
         resp = await dns.asyncquery.udp(
             dns.message.make_query(question.name, dns.rdatatype.A),
-            self._cn_upstream if DomainPolicy.CN_DOMAIN in policy else self._global_upstream,
+            self._cn_upstream if DomainPolicy.CN_DOMAIN in policy else self._global_upstream_v4,
         )
         return resp.answer if DomainPolicy.CN_DOMAIN in policy or self._is_cn_ip_answer(resp.answer) else []
 
@@ -118,11 +120,11 @@ class Server:
         a_resp, aaaa_resp = await asyncio.gather(
             dns.asyncquery.udp(
                 dns.message.make_query(question.name, dns.rdatatype.A),
-                self._global_upstream,
+                self._global_upstream_v4,
             ),
             dns.asyncquery.udp(
                 dns.message.make_query(question.name, dns.rdatatype.AAAA),
-                self._global_upstream,
+                self._global_upstream_v6,
             ),
         )
 
@@ -153,7 +155,7 @@ class Server:
         logger.debug(f'Handling question {question}, domain policy {self._get_domain_policy(question.name)}')
         if question.rdtype not in (dns.rdatatype.A, dns.rdatatype.AAAA) or \
            question.rdclass != dns.rdataclass.IN:
-            return await dns.asyncquery.udp(request, self._global_upstream)
+            return await dns.asyncquery.udp(request, self._global_upstream_v4)
 
         response = dns.message.make_response(request, recursion_available=True)
         response.answer = await (
