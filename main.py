@@ -110,7 +110,12 @@ class Server:
             dns.message.make_query(question.name, dns.rdatatype.A),
             self._cn_upstream if DomainPolicy.CN_DOMAIN in policy else self._global_upstream_v4,
         )
-        return resp.answer if DomainPolicy.CN_DOMAIN in policy or self._is_cn_ip_answer(resp.answer) else []
+        if DomainPolicy.CN_DOMAIN in policy or self._is_cn_ip_answer(resp.answer):
+            return resp.answer
+        # hack: sleep for a short period of time before returning empty result
+        # hopefully resolve an issue (firefox bug?) where NXDOMAIN error is shown in firefox
+        await asyncio.sleep(0.1)
+        return []
 
     async def _handle_query_aaaa(self, question: dns.rrset.RRset) -> list[dns.rrset.RRset]:
         policy = self._get_domain_policy(question.name)
