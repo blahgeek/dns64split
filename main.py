@@ -7,6 +7,7 @@ import functools
 import os
 import asyncio
 import logging
+import typing as tp
 
 import geoip2.database
 import geoip2.errors
@@ -63,11 +64,47 @@ def get_geoip2_db() -> geoip2.database.Reader:
     return geoip2.database.Reader(_GEOLITE2_COUNTRY_DB_PATH)
 
 
+TP_K = tp.TypeVar('TP_K')
+TP_V = tp.TypeVar('TP_V')
+
+class LruCacheMap(tp.Generic[TP_K, TP_V]):
+    '''
+    Lru cache map, asyncio-safe.
+    '''
+    def __init__(self, max_size: int):
+        self._max_size = max_size
+        self._kv: collections.OrderedDict[TP_K, TP_V] = collections.OrderedDict()
+        self._lock = asyncio.Lock()
+
+    async def get_or_set(self, k: TP_K, v: TP_V) -> TP_V:
+        '''
+        If k exists in map, return its value;
+        otherwise, set v as its value and return.
+        '''
+        async with self._lock:
+            if k in self._kv:
+                self._kv.move_to_end(k)
+                return self._kv[k]
+            self._kv[k] = v
+            if len(self._kv) > self._max_size:
+                self._kv.popitem(last=False)
+            return v
+
+
 class Server:
     def __init__(self, *, dns64_prefix: str, config_path: str | None):
         self._domain_policies = _parse_domain_policies_from_config(config_path)
+        # The result of "_has_cn_ip_answer" for a domain should be cached
+        # because it needs to be consistant.
+        # If, during an A query, the domain is treated as non-CN-ip-answer-domain,
+        # and during an AAAA query, the domain is treated as yes,
+        # then both responses would be empty.
+        self._has_cn_ip_answer_domain_cache: \
+            LruCacheMap[dns.name.Name, bool] = LruCacheMap(16 * 1024)
+
         self._dns64_prefix = dns64_prefix
         assert self._dns64_prefix.endswith('::')
+
         self._cn_upstream = '114.114.114.114'
         # Our VPS may have different isp for v4 and v6 network (e.g. due to tunneling),
         # so use v4 and v6 dns server for A and AAAA queries respectively.
@@ -93,24 +130,32 @@ class Server:
         except geoip2.errors.AddressNotFoundError:
             return False
 
-    def _is_cn_ip_answer(self, answer: list[dns.rrset.RRset]) -> bool:
+    async def _has_cn_ip_answer(self, domain: dns.name.Name, answer: list[dns.rrset.RRset]) -> bool:
+        result = False
         for ans in answer:
             if ans.rdclass == dns.rdataclass.IN \
                and ans.rdtype in (dns.rdatatype.A, dns.rdatatype.AAAA) \
                and any(self._is_cn_ip(x.address) for x in ans):
-                return True
-        return False
+                result = True
+        return await self._has_cn_ip_answer_domain_cache.get_or_set(domain, result)
 
     async def _handle_query_a(self, question: dns.rrset.RRset) -> list[dns.rrset.RRset]:
         '''
         Return A response as-is only if it's from CN
         '''
         policy = self._get_domain_policy(question.name)
+        if DomainPolicy.CN_DOMAIN in policy:
+            resp = await dns.asyncquery.udp(
+                dns.message.make_query(question.name, dns.rdatatype.A),
+                self._cn_upstream
+            )
+            return resp.answer
+
         resp = await dns.asyncquery.udp(
             dns.message.make_query(question.name, dns.rdatatype.A),
-            self._cn_upstream if DomainPolicy.CN_DOMAIN in policy else self._global_upstream_v4,
+            self._global_upstream_v4,
         )
-        if DomainPolicy.CN_DOMAIN in policy or self._is_cn_ip_answer(resp.answer):
+        if await self._has_cn_ip_answer(question.name, resp.answer):
             return resp.answer
         # hack: sleep for a short period of time before returning empty result
         # hopefully resolve an issue (firefox bug?) where NXDOMAIN error is shown in firefox
@@ -133,7 +178,7 @@ class Server:
             ),
         )
 
-        if self._is_cn_ip_answer(a_resp.answer):
+        if await self._has_cn_ip_answer(question.name, a_resp.answer):
             return []
 
         if DomainPolicy.IGNORE_NATIVE_IPV6 not in policy and \
