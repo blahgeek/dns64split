@@ -13,11 +13,14 @@ import geoip2.database
 import geoip2.errors
 import dns.name
 import dns.message
+import dns.rdata
 import dns.rdatatype
 import dns.rdataclass
 import dns.rrset
 import dns.rcode
+import dns.rdtypes.svcbbase
 import dns.rdtypes.IN.AAAA
+import dns.rdtypes.IN.HTTPS
 import dns.asyncquery
 
 
@@ -200,12 +203,41 @@ class Server:
                 result.append(ans)
         return result
 
+    def _filter_special_answer_rr(self, rr: dns.rdata.Rdata) -> dns.rdata.Rdata | None:
+        if rr.rdclass == dns.rdataclass.IN and rr.rdtype == dns.rdatatype.HTTPS:
+            # Remove ipv4hint and ipv6hint from HTTPS answers
+            rr = tp.cast(dns.rdtypes.IN.HTTPS.HTTPS, rr)
+            return dns.rdtypes.IN.HTTPS.HTTPS(
+                rr.rdclass, rr.rdtype,
+                priority=rr.priority,
+                target=rr.target,
+                params=dict(kv for kv in rr.params.items()
+                            if kv[0] not in (dns.rdtypes.svcbbase.ParamKey.IPV4HINT,
+                                             dns.rdtypes.svcbbase.ParamKey.IPV6HINT))
+            )
+        return rr
+
+    def _filter_special_answer(self, answers: list[dns.rrset.RRset]) -> list[dns.rrset.RRset]:
+        '''
+        Filter answers that is not A or AAAA.
+        '''
+        final_answers: list[dns.rrset.RRset] = []
+        for rrset in answers:
+            final_rrset = dns.rrset.RRset(rrset.name, rrset.rdclass, rrset.rdtype, rrset.covers)
+            for rr in rrset:
+                if final_rr := self._filter_special_answer_rr(rr):
+                    final_rrset.add(final_rr)
+                    final_answers.append(final_rrset)
+        return final_answers
+
     async def _handle_query(self, request: dns.message.Message) -> dns.message.Message:
         question = request.question[0]
         logger.debug(f'Handling question {question}, domain policy {self._get_domain_policy(question.name)}')
         if question.rdtype not in (dns.rdatatype.A, dns.rdatatype.AAAA) or \
            question.rdclass != dns.rdataclass.IN:
-            return await dns.asyncquery.udp(request, self._global_upstream_v4)
+            response = await dns.asyncquery.udp(request, self._global_upstream_v4)
+            response.answer = self._filter_special_answer(response.answer)
+            return response
 
         response = dns.message.make_response(request, recursion_available=True)
         response.answer = await (
