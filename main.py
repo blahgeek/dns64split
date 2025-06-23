@@ -8,6 +8,7 @@ import os
 import asyncio
 import logging
 import typing as tp
+import ipaddress
 
 import geoip2.database
 import geoip2.errors
@@ -19,6 +20,7 @@ import dns.rdataclass
 import dns.rrset
 import dns.rcode
 import dns.rdtypes.svcbbase
+import dns.rdtypes.IN.A
 import dns.rdtypes.IN.AAAA
 import dns.rdtypes.IN.HTTPS
 import dns.asyncquery
@@ -133,6 +135,24 @@ class Server:
         except geoip2.errors.AddressNotFoundError:
             return False
 
+    def _is_nat64_domain(self, name: dns.name.Name) -> str | None:
+        """
+        Check if domain is in format x.x.x.x.nat64 and return the IPv4 address if valid.
+        Returns None if not a valid nat64 domain.
+        """
+        labels = [x.decode().lower() for x in name.labels if x]
+        if len(labels) >= 5 and labels[-1] == 'nat64':
+            # Try to parse the first 4 labels as IPv4 octets
+            try:
+                octets = labels[-5:-1]  # Get the 4 labels before 'nat64'
+                ip_str = '.'.join(octets)
+                # Validate it's a proper IPv4 address
+                ipaddress.IPv4Address(ip_str)
+                return ip_str
+            except (ValueError, ipaddress.AddressValueError):
+                pass
+        return None
+
     async def _has_cn_ip_answer(self, domain: dns.name.Name, answer: list[dns.rrset.RRset]) -> bool:
         result = False
         for ans in answer:
@@ -146,6 +166,9 @@ class Server:
         '''
         Return A response as-is only if it's from CN
         '''
+        if self._is_nat64_domain(question.name):
+            return []
+
         policy = self._get_domain_policy(question.name)
         if DomainPolicy.CN_DOMAIN in policy:
             resp = await dns.asyncquery.udp(
@@ -166,6 +189,17 @@ class Server:
         return []
 
     async def _handle_query_aaaa(self, question: dns.rrset.RRset) -> list[dns.rrset.RRset]:
+        # Check if this is a nat64 domain (e.g., 1.2.3.4.nat64)
+        if ipv4_addr := self._is_nat64_domain(question.name):
+            # Create synthetic AAAA record with DNS64 prefix + IPv4 address
+            dns64_ans = dns.rrset.from_rdata_list(
+                question.name, 300,  # 5 minute TTL
+                [dns.rdtypes.IN.AAAA.AAAA(
+                    dns.rdataclass.IN, dns.rdatatype.AAAA,
+                    self._dns64_prefix + ipv4_addr,
+                )])
+            return [dns64_ans]
+
         policy = self._get_domain_policy(question.name)
         if DomainPolicy.CN_DOMAIN in policy:
             return []
