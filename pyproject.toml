@@ -1,0 +1,10 @@
+[project]
+name = "dns64split"
+version = "0.1.0"
+description = ""
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = [
+    "dnspython",
+    "geoip2",
+]
