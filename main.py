@@ -153,6 +153,44 @@ class Server:
                 pass
         return None
 
+    def _is_nat64_ptr_query(self, name: dns.name.Name) -> str | None:
+        """
+        Check if this is a PTR query for an IPv6 address that matches our DNS64 prefix.
+        Returns the embedded IPv4 address if it matches, None otherwise.
+        """
+        labels = [x.decode().lower() for x in name.labels if x]
+
+        # PTR queries for IPv6 are in ip6.arpa format
+        if len(labels) < 34 or labels[-2:] != ['ip6', 'arpa']:
+            return None
+
+        # Extract the 32 hex digits (each label is one hex digit)
+        hex_digits = labels[-34:-2]  # Skip 'ip6.arpa'
+        if len(hex_digits) != 32:
+            return None
+
+        try:
+            # Reverse the order and join to form IPv6 address
+            hex_str = ''.join(reversed(hex_digits))
+            # Insert colons every 4 characters
+            ipv6_str = ':'.join(hex_str[i:i+4] for i in range(0, 32, 4))
+            ipv6_addr = ipaddress.IPv6Address(ipv6_str)
+
+            # Check if this IPv6 address starts with our DNS64 prefix
+            prefix_addr = ipaddress.IPv6Address(self._dns64_prefix + '0.0.0.0')
+            prefix_network = ipaddress.IPv6Network(f"{prefix_addr}/{96}")
+
+            if ipv6_addr in prefix_network:
+                # Extract the last 32 bits as IPv4 address
+                ipv4_int = int(ipv6_addr) & 0xFFFFFFFF
+                ipv4_addr = ipaddress.IPv4Address(ipv4_int)
+                return str(ipv4_addr)
+
+        except (ValueError, ipaddress.AddressValueError):
+            pass
+
+        return None
+
     async def _has_cn_ip_answer(self, domain: dns.name.Name, answer: list[dns.rrset.RRset]) -> bool:
         result = False
         for ans in answer:
@@ -237,6 +275,29 @@ class Server:
                 result.append(ans)
         return result
 
+    async def _handle_query_ptr(self, question: dns.rrset.RRset) -> list[dns.rrset.RRset]:
+        """
+        Handle PTR queries, including synthetic responses for nat64 domains.
+        """
+        # Check if this is a PTR query for a synthetic IPv6 address
+        if ipv4_addr := self._is_nat64_ptr_query(question.name):
+            # Create synthetic PTR record pointing to .nat64 domain
+            nat64_domain = f"{ipv4_addr}.nat64."
+            ptr_ans = dns.rrset.from_rdata_list(
+                question.name, 300,  # 5 minute TTL
+                [dns.rdata.from_text(
+                    dns.rdataclass.IN, dns.rdatatype.PTR,
+                    nat64_domain,
+                )])
+            return [ptr_ans]
+
+        # For regular PTR queries, forward to upstream
+        resp = await dns.asyncquery.udp(
+            dns.message.make_query(question.name, dns.rdatatype.PTR),
+            self._global_upstream_v4,
+        )
+        return resp.answer
+
     def _filter_special_answer_rr(self, rr: dns.rdata.Rdata) -> dns.rdata.Rdata | None:
         if rr.rdclass == dns.rdataclass.IN and rr.rdtype == dns.rdatatype.HTTPS:
             # Remove ipv4hint and ipv6hint from HTTPS answers
@@ -267,17 +328,21 @@ class Server:
     async def _handle_query(self, request: dns.message.Message) -> dns.message.Message:
         question = request.question[0]
         logger.debug(f'Handling question {question}, domain policy {self._get_domain_policy(question.name)}')
-        if question.rdtype not in (dns.rdatatype.A, dns.rdatatype.AAAA) or \
-           question.rdclass != dns.rdataclass.IN:
-            response = await dns.asyncquery.udp(request, self._global_upstream_v4)
-            response.answer = self._filter_special_answer(response.answer)
+
+        # Handle special record types (A, AAAA, PTR) for IN class
+        if question.rdclass == dns.rdataclass.IN and question.rdtype in (dns.rdatatype.A, dns.rdatatype.AAAA, dns.rdatatype.PTR):
+            response = dns.message.make_response(request, recursion_available=True)
+            if question.rdtype == dns.rdatatype.A:
+                response.answer = await self._handle_query_a(question)
+            elif question.rdtype == dns.rdatatype.AAAA:
+                response.answer = await self._handle_query_aaaa(question)
+            elif question.rdtype == dns.rdatatype.PTR:
+                response.answer = await self._handle_query_ptr(question)
             return response
 
-        response = dns.message.make_response(request, recursion_available=True)
-        response.answer = await (
-            self._handle_query_a(question) if question.rdtype == dns.rdatatype.A
-            else self._handle_query_aaaa(question)
-        )
+        # Forward all other queries to upstream
+        response = await dns.asyncquery.udp(request, self._global_upstream_v4)
+        response.answer = self._filter_special_answer(response.answer)
         return response
 
     async def handle_query(self, request: dns.message.Message) -> dns.message.Message:
