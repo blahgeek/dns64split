@@ -20,7 +20,6 @@ import dns.rdataclass
 import dns.rrset
 import dns.rcode
 import dns.rdtypes.svcbbase
-import dns.rdtypes.IN.A
 import dns.rdtypes.IN.AAAA
 import dns.rdtypes.IN.HTTPS
 import dns.asyncquery
