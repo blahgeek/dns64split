@@ -2,13 +2,13 @@
 # -*- coding: utf-8 -*-
 
 import collections
-import enum
 import functools
 import os
 import asyncio
 import logging
 import typing as tp
 import ipaddress
+import dataclasses
 
 import geoip2.database
 import geoip2.errors
@@ -33,24 +33,25 @@ _SERVER_TIMEOUT = 5.0
 logger = logging.getLogger('dns64split')
 
 
-class DomainPolicy(enum.Flag):
-    CN_DOMAIN = enum.auto()
-    IGNORE_NATIVE_IPV6 = enum.auto()
+@dataclasses.dataclass
+class DomainPolicy:
+    cn_domain: bool = False
+    ignore_native_ipv6: bool = False
 
 
 def _parse_domain_policies_from_config(config_path: str | None) -> dict[str, DomainPolicy]:
-    result = collections.defaultdict(lambda: DomainPolicy(0))
+    result = collections.defaultdict(lambda: DomainPolicy())
     # 1. special china domain list file
-    result['cn'] |= DomainPolicy.CN_DOMAIN  # ".cn"
+    result['cn'].cn_domain = True  # ".cn"
     with open(_CHINA_DOMAIN_LIST_PATH) as f:
         logger.info(f'Reading china domain list from {_CHINA_DOMAIN_LIST_PATH}')
         for line in f.readlines():
             line = line.strip()
             if line:
-                result[line] |= DomainPolicy.CN_DOMAIN
+                result[line].cn_domain = True
     # 2. config file
     # each line format:
-    # <domain>:<policy1>,<policy2>
+    # <domain>:<attr1>,<attr2=val2>
     if config_path and os.path.exists(config_path):
         logger.info(f'Reading config from {config_path}')
         with open(config_path) as f:
@@ -58,9 +59,13 @@ def _parse_domain_policies_from_config(config_path: str | None) -> dict[str, Dom
                 line = line.strip()
                 if not line or line.startswith('#'):
                     continue
-                domain, _, policies = line.partition(':')
-                for policy in policies.split(','):
-                    result[domain] |= getattr(DomainPolicy, policy.upper())
+                domain, _, kvs = line.partition(':')
+                for kv in kvs.split(','):
+                    kv_fields = kv.split('=', 1)
+                    if len(kv_fields) == 1:
+                        setattr(result[domain], kv_fields[0], True)
+                    else:
+                        setattr(result[domain], kv_fields[0], kv_fields[1])
     return dict(result)
 
 @functools.cache
@@ -125,7 +130,7 @@ class Server:
             suffix = '.'.join(labels[-i:])
             if res := self._domain_policies.get(suffix):
                 return res
-        return DomainPolicy(0)
+        return DomainPolicy()
 
     def _is_cn_ip(self, ip: str) -> bool:
         try:
@@ -207,7 +212,7 @@ class Server:
             return []
 
         policy = self._get_domain_policy(question.name)
-        if DomainPolicy.CN_DOMAIN in policy:
+        if policy.cn_domain:
             resp = await dns.asyncquery.udp(
                 dns.message.make_query(question.name, dns.rdatatype.A),
                 self._cn_upstream
@@ -238,7 +243,7 @@ class Server:
             return [dns64_ans]
 
         policy = self._get_domain_policy(question.name)
-        if DomainPolicy.CN_DOMAIN in policy:
+        if policy.cn_domain:
             return []
 
         a_resp, aaaa_resp = await asyncio.gather(
@@ -255,7 +260,7 @@ class Server:
         if await self._has_cn_ip_answer(question.name, a_resp.answer):
             return []
 
-        if DomainPolicy.IGNORE_NATIVE_IPV6 not in policy and \
+        if not policy.ignore_native_ipv6 and \
            any(ans.rdclass == dns.rdataclass.IN and ans.rdtype == dns.rdatatype.AAAA
                for ans in aaaa_resp.answer):
             return aaaa_resp.answer
