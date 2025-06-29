@@ -384,7 +384,7 @@ async def main(server: Server, port: int):
     loop = asyncio.get_event_loop()
     transport, _ = await loop.create_datagram_endpoint(
         lambda: Protocol(server),
-        local_addr=('0.0.0.0', port),
+        local_addr=('127.0.0.1', port),
     )
     try:
         await loop.create_future()
