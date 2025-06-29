@@ -216,7 +216,7 @@ class Server:
         if policy.cn_domain:
             resp = await dns.asyncquery.udp(
                 dns.message.make_query(question.name, dns.rdatatype.A),
-                self._cn_upstream
+                policy.upstream or self._cn_upstream
             )
             return resp.answer
 
