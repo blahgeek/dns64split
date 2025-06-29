@@ -263,6 +263,7 @@ class Server:
 
         if not policy.ignore_native_ipv6 and \
            any(ans.rdclass == dns.rdataclass.IN and ans.rdtype == dns.rdatatype.AAAA
+               and any(x.address != '::' for x in ans)
                for ans in aaaa_resp.answer):
             return aaaa_resp.answer
 
