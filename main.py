@@ -35,21 +35,27 @@ logger = logging.getLogger('dns64split')
 
 @dataclasses.dataclass
 class DomainPolicy:
-    cn_domain: bool = False
+    country: str | None = ''
     ignore_native_ipv6: bool = False
     upstream: str | None = None
+
+    def is_known_cn_domain(self):
+        return self.country and self.country.lower() == 'cn'
+
+    def is_known_global_domain(self):
+        return self.country and self.country.lower() != 'cn'
 
 
 def _parse_domain_policies_from_config(config_path: str | None) -> dict[str, DomainPolicy]:
     result = collections.defaultdict(lambda: DomainPolicy())
     # 1. special china domain list file
-    result['cn'].cn_domain = True  # ".cn"
+    result['cn'].country = 'cn'
     with open(_CHINA_DOMAIN_LIST_PATH) as f:
         logger.info(f'Reading china domain list from {_CHINA_DOMAIN_LIST_PATH}')
         for line in f.readlines():
             line = line.strip()
             if line:
-                result[line].cn_domain = True
+                result[line].country = 'cn'
     # 2. config file
     # each line format:
     # <domain>:<attr1>,<attr2=val2>
@@ -209,11 +215,12 @@ class Server:
         '''
         Return A response as-is only if it's from CN
         '''
-        if self._is_nat64_domain(question.name):
+        policy = self._get_domain_policy(question.name)
+
+        if self._is_nat64_domain(question.name) or policy.is_known_global_domain():
             return []
 
-        policy = self._get_domain_policy(question.name)
-        if policy.cn_domain:
+        if policy.is_known_cn_domain():
             resp = await dns.asyncquery.udp(
                 dns.message.make_query(question.name, dns.rdatatype.A),
                 policy.upstream or self._cn_upstream
@@ -244,7 +251,7 @@ class Server:
             return [dns64_ans]
 
         policy = self._get_domain_policy(question.name)
-        if policy.cn_domain:
+        if policy.is_known_cn_domain():
             return []
 
         a_resp, aaaa_resp = await asyncio.gather(
@@ -258,7 +265,7 @@ class Server:
             ),
         )
 
-        if await self._has_cn_ip_answer(question.name, a_resp.answer):
+        if not policy.is_known_global_domain() and await self._has_cn_ip_answer(question.name, a_resp.answer):
             return []
 
         if not policy.ignore_native_ipv6 and \
