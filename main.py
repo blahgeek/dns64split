@@ -37,6 +37,7 @@ logger = logging.getLogger('dns64split')
 class DomainPolicy:
     cn_domain: bool = False
     ignore_native_ipv6: bool = False
+    upstream: str | None = None
 
 
 def _parse_domain_policies_from_config(config_path: str | None) -> dict[str, DomainPolicy]:
@@ -221,7 +222,7 @@ class Server:
 
         resp = await dns.asyncquery.udp(
             dns.message.make_query(question.name, dns.rdatatype.A),
-            self._global_upstream_v4,
+            policy.upstream or self._global_upstream_v4,
         )
         if await self._has_cn_ip_answer(question.name, resp.answer):
             return resp.answer
@@ -249,11 +250,11 @@ class Server:
         a_resp, aaaa_resp = await asyncio.gather(
             dns.asyncquery.udp(
                 dns.message.make_query(question.name, dns.rdatatype.A),
-                self._global_upstream_v4,
+                policy.upstream or self._global_upstream_v4,
             ),
             dns.asyncquery.udp(
                 dns.message.make_query(question.name, dns.rdatatype.AAAA),
-                self._global_upstream_v6,
+                policy.upstream or self._global_upstream_v6,
             ),
         )
 
