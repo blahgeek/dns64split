@@ -9,3 +9,13 @@ curl -L -o - https://github.com/felixonmars/dnsmasq-china-list/raw/refs/heads/ma
 curl -L -o - https://github.com/felixonmars/dnsmasq-china-list/raw/refs/heads/master/apple.china.conf \
      | sed -E 's/server=\/([^\/]+)\/.*/\1/' >> data/china-domain-list.txt
 
+
+# https://github.com/felixonmars/dnsmasq-china-list/issues/682
+SED="sed"
+# if it's macos, use gsed. use uname
+if [[ "$(uname)" == "Darwin" ]]; then
+    SED="gsed"
+fi
+
+"$SED" -i '/^top$/d' data/china-domain-list.txt
+
