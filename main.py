@@ -147,10 +147,6 @@ def _is_nat64_ptr_query(name: dns.name.Name, dns64_prefix: str) -> str | None:
     return None
 
 
-def _remove_cname_answer(ans: list[dns.rrset.RRset]) -> list[dns.rrset.RRset]:
-    return [rrset for rrset in ans if rrset.rdtype != dns.rdatatype.CNAME]
-
-
 TP_K = tp.TypeVar('TP_K')
 TP_V = tp.TypeVar('TP_V')
 
@@ -260,6 +256,9 @@ class Server:
                 return res
         return DomainPolicy()
 
+
+
+
     async def _query_global_a_cached(self, domain: dns.name.Name, policy: DomainPolicy) -> \
               tuple[dns.message.Message, bool]:
         """
@@ -293,11 +292,11 @@ class Server:
                 dns.message.make_query(question.name, dns.rdatatype.A),
                 policy.upstream or self._cn_upstream
             )
-            return _remove_cname_answer(resp.answer)
+            return resp.answer
 
         resp, has_cn_ip = await self._query_global_a_cached(question.name, policy)
         if has_cn_ip:
-            return _remove_cname_answer(resp.answer)
+            return resp.answer
         # hack: sleep for a short period of time before returning empty result
         # hopefully resolve an issue (firefox bug?) where NXDOMAIN error is shown in firefox
         await asyncio.sleep(0.1)
@@ -334,7 +333,7 @@ class Server:
            any(ans.rdclass == dns.rdataclass.IN and ans.rdtype == dns.rdatatype.AAAA
                and any(x.address != '::' for x in ans)
                for ans in aaaa_resp.answer):
-            return _remove_cname_answer(aaaa_resp.answer)
+            return aaaa_resp.answer
 
         result: list[dns.rrset.RRset] = []
         for ans in a_resp.answer:
@@ -346,6 +345,8 @@ class Server:
                         self._dns64_prefix + data.address,
                     ) for data in ans])
                 result.append(dns64_ans)
+            else:
+                result.append(ans)
         return result
 
     async def _handle_query_ptr(self, question: dns.rrset.RRset) -> list[dns.rrset.RRset]:
@@ -396,7 +397,7 @@ class Server:
                 if final_rr := self._filter_special_answer_rr(rr):
                     final_rrset.add(final_rr)
                     final_answers.append(final_rrset)
-        return _remove_cname_answer(final_answers)
+        return final_answers
 
     async def _handle_query(self, request: dns.message.Message) -> dns.message.Message:
         question = request.question[0]
