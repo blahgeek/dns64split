@@ -6,6 +6,7 @@ import functools
 import os
 import asyncio
 import logging
+import time
 import typing as tp
 import ipaddress
 import dataclasses
@@ -83,14 +84,32 @@ def get_geoip2_db() -> geoip2.database.Reader:
 TP_K = tp.TypeVar('TP_K')
 TP_V = tp.TypeVar('TP_V')
 
-class LruCacheMap(tp.Generic[TP_K, TP_V]):
+class CacheMap(tp.Generic[TP_K, TP_V]):
     '''
-    Lru cache map, asyncio-safe.
+    Cache map, Size and/or Timed bound, asyncio-safe.
     '''
-    def __init__(self, max_size: int):
-        self._max_size = max_size
-        self._kv: collections.OrderedDict[TP_K, TP_V] = collections.OrderedDict()
+    def __init__(self, *,
+                 max_cache_size: int = 16 * 1024,
+                 max_cache_duration: float = 24 * 3600):
+        self._max_cache_size = max_cache_size
+        self._max_cache_duration = max_cache_duration
+        # key -> (value, expire_timestamp). Also lru ordered
+        self._kv: collections.OrderedDict[TP_K, tuple[TP_V, float]] = collections.OrderedDict()
+        self._kv_fn: dict[TP_K, asyncio.Future[TP_V]] = {}
         self._lock = asyncio.Lock()
+
+    def _get_locked(self, k: TP_K) -> TP_V:
+        if k in self._kv:
+            if self._kv[k][1] > time.monotonic():
+                return self._kv[k][0]
+        raise KeyError(f'Key not found: {k}')
+
+    def _set_locked(self, k: TP_K, v: TP_V):
+        now = time.monotonic()
+        self._kv[k] = (v, now + self._max_cache_duration)
+        while self._kv and (len(self._kv) > self._max_cache_size or
+                            next(iter(self._kv.values()))[1] < now):
+            self._kv.popitem(last=False)
 
     async def get_or_set(self, k: TP_K, v: TP_V) -> TP_V:
         '''
@@ -98,13 +117,42 @@ class LruCacheMap(tp.Generic[TP_K, TP_V]):
         otherwise, set v as its value and return.
         '''
         async with self._lock:
-            if k in self._kv:
-                self._kv.move_to_end(k)
-                return self._kv[k]
-            self._kv[k] = v
-            if len(self._kv) > self._max_size:
-                self._kv.popitem(last=False)
-            return v
+            try:
+                return self._get_locked(k)
+            except KeyError:
+                self._set_locked(k, v)
+                return v
+
+    async def get_or_set_by_fn(self, k: TP_K, fn: tp.Callable[[], tp.Coroutine[None, None, TP_V]]) -> TP_V:
+        '''
+        If k exists in map, return its value;
+        otherwise, execute fn() and return its value; but if another job for the same key is already running, wait for it instead.
+        '''
+        future: asyncio.Future[TP_V] | None = None
+        is_owner = False
+        async with self._lock:
+            try:
+                return self._get_locked(k)
+            except KeyError:
+                future = self._kv_fn.get(k)
+                if not future:
+                    future = asyncio.create_task(fn())
+                    self._kv_fn[k] = future
+                    is_owner = True
+
+        try:
+            result = await future
+        except asyncio.CancelledError:
+            future.cancel()
+            raise asyncio.TimeoutError()
+
+        if is_owner:
+            async with self._lock:
+                del self._kv_fn[k]
+                self._set_locked(k, result)
+
+        return result
+
 
 
 class Server:
@@ -115,8 +163,11 @@ class Server:
         # If, during an A query, the domain is treated as non-CN-ip-answer-domain,
         # and during an AAAA query, the domain is treated as yes,
         # then both responses would be empty.
-        self._has_cn_ip_answer_domain_cache: \
-            LruCacheMap[dns.name.Name, bool] = LruCacheMap(16 * 1024)
+        self._has_cn_ip_answer_domain_cache: CacheMap[dns.name.Name, bool] = \
+            CacheMap(max_cache_size=16 * 1024, max_cache_duration=24 * 3600)
+
+        self._global_a_query_cache: CacheMap[dns.name.Name, dns.message.Message] = \
+            CacheMap(max_cache_duration=30)
 
         self._dns64_prefix = dns64_prefix
         assert self._dns64_prefix.endswith('::')
@@ -202,14 +253,24 @@ class Server:
 
         return None
 
-    async def _has_cn_ip_answer(self, domain: dns.name.Name, answer: list[dns.rrset.RRset]) -> bool:
-        result = False
-        for ans in answer:
+    async def _query_global_a_cached(self, domain: dns.name.Name, policy: DomainPolicy) -> \
+              tuple[dns.message.Message, bool]:
+        """
+        Return result, and has_cn_ip_answer
+        """
+        resp = await self._global_a_query_cache.get_or_set_by_fn(
+            domain,
+            lambda: dns.asyncquery.udp(dns.message.make_query(domain, dns.rdatatype.A),
+                                       policy.upstream or self._global_upstream_v4),
+        )
+        has_cn_ip = False
+        for ans in resp.answer:
             if ans.rdclass == dns.rdataclass.IN \
                and ans.rdtype in (dns.rdatatype.A, dns.rdatatype.AAAA) \
                and any(self._is_cn_ip(x.address) for x in ans):
-                result = True
-        return await self._has_cn_ip_answer_domain_cache.get_or_set(domain, result)
+                has_cn_ip = True
+        has_cn_ip = await self._has_cn_ip_answer_domain_cache.get_or_set(domain, has_cn_ip)
+        return (resp, has_cn_ip)
 
     async def _handle_query_a(self, question: dns.rrset.RRset) -> list[dns.rrset.RRset]:
         '''
@@ -227,11 +288,8 @@ class Server:
             )
             return resp.answer
 
-        resp = await dns.asyncquery.udp(
-            dns.message.make_query(question.name, dns.rdatatype.A),
-            policy.upstream or self._global_upstream_v4,
-        )
-        if await self._has_cn_ip_answer(question.name, resp.answer):
+        resp, has_cn_ip = await self._query_global_a_cached(question.name, policy)
+        if has_cn_ip:
             return resp.answer
         # hack: sleep for a short period of time before returning empty result
         # hopefully resolve an issue (firefox bug?) where NXDOMAIN error is shown in firefox
@@ -254,18 +312,15 @@ class Server:
         if policy.is_known_cn_domain():
             return []
 
-        a_resp, aaaa_resp = await asyncio.gather(
-            dns.asyncquery.udp(
-                dns.message.make_query(question.name, dns.rdatatype.A),
-                policy.upstream or self._global_upstream_v4,
-            ),
+        (a_resp, has_cn_ip), aaaa_resp = await asyncio.gather(
+            self._query_global_a_cached(question.name, policy),
             dns.asyncquery.udp(
                 dns.message.make_query(question.name, dns.rdatatype.AAAA),
                 policy.upstream or self._global_upstream_v6,
             ),
         )
 
-        if not policy.is_known_global_domain() and await self._has_cn_ip_answer(question.name, a_resp.answer):
+        if not policy.is_known_global_domain() and has_cn_ip:
             return []
 
         if not policy.ignore_native_ipv6 and \
