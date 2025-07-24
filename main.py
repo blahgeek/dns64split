@@ -81,6 +81,72 @@ def get_geoip2_db() -> geoip2.database.Reader:
     return geoip2.database.Reader(_GEOLITE2_COUNTRY_DB_PATH)
 
 
+def _is_cn_ip(ip: str) -> bool:
+    try:
+        res = get_geoip2_db().country(ip)
+        return res.country.iso_code == 'CN'
+    except geoip2.errors.AddressNotFoundError:
+        return False
+
+
+def _is_nat64_domain(name: dns.name.Name) -> str | None:
+    """
+    Check if domain is in format x.x.x.x.nat64 and return the IPv4 address if valid.
+    Returns None if not a valid nat64 domain.
+    """
+    labels = [x.decode().lower() for x in name.labels if x]
+    if len(labels) >= 5 and labels[-1] == 'nat64':
+        # Try to parse the first 4 labels as IPv4 octets
+        try:
+            octets = labels[-5:-1]  # Get the 4 labels before 'nat64'
+            ip_str = '.'.join(octets)
+            # Validate it's a proper IPv4 address
+            ipaddress.IPv4Address(ip_str)
+            return ip_str
+        except (ValueError, ipaddress.AddressValueError):
+            pass
+    return None
+
+
+def _is_nat64_ptr_query(name: dns.name.Name, dns64_prefix: str) -> str | None:
+    """
+    Check if this is a PTR query for an IPv6 address that matches our DNS64 prefix.
+    Returns the embedded IPv4 address if it matches, None otherwise.
+    """
+    labels = [x.decode().lower() for x in name.labels if x]
+
+    # PTR queries for IPv6 are in ip6.arpa format
+    if len(labels) < 34 or labels[-2:] != ['ip6', 'arpa']:
+        return None
+
+    # Extract the 32 hex digits (each label is one hex digit)
+    hex_digits = labels[-34:-2]  # Skip 'ip6.arpa'
+    if len(hex_digits) != 32:
+        return None
+
+    try:
+        # Reverse the order and join to form IPv6 address
+        hex_str = ''.join(reversed(hex_digits))
+        # Insert colons every 4 characters
+        ipv6_str = ':'.join(hex_str[i:i+4] for i in range(0, 32, 4))
+        ipv6_addr = ipaddress.IPv6Address(ipv6_str)
+
+        # Check if this IPv6 address starts with our DNS64 prefix
+        prefix_addr = ipaddress.IPv6Address(dns64_prefix + '0.0.0.0')
+        prefix_network = ipaddress.IPv6Network(f"{prefix_addr}/{96}")
+
+        if ipv6_addr in prefix_network:
+            # Extract the last 32 bits as IPv4 address
+            ipv4_int = int(ipv6_addr) & 0xFFFFFFFF
+            ipv4_addr = ipaddress.IPv4Address(ipv4_int)
+            return str(ipv4_addr)
+
+    except (ValueError, ipaddress.AddressValueError):
+        pass
+
+    return None
+
+
 TP_K = tp.TypeVar('TP_K')
 TP_V = tp.TypeVar('TP_V')
 
@@ -190,68 +256,8 @@ class Server:
                 return res
         return DomainPolicy()
 
-    def _is_cn_ip(self, ip: str) -> bool:
-        try:
-            res = get_geoip2_db().country(ip)
-            return res.country.iso_code == 'CN'
-        except geoip2.errors.AddressNotFoundError:
-            return False
 
-    def _is_nat64_domain(self, name: dns.name.Name) -> str | None:
-        """
-        Check if domain is in format x.x.x.x.nat64 and return the IPv4 address if valid.
-        Returns None if not a valid nat64 domain.
-        """
-        labels = [x.decode().lower() for x in name.labels if x]
-        if len(labels) >= 5 and labels[-1] == 'nat64':
-            # Try to parse the first 4 labels as IPv4 octets
-            try:
-                octets = labels[-5:-1]  # Get the 4 labels before 'nat64'
-                ip_str = '.'.join(octets)
-                # Validate it's a proper IPv4 address
-                ipaddress.IPv4Address(ip_str)
-                return ip_str
-            except (ValueError, ipaddress.AddressValueError):
-                pass
-        return None
 
-    def _is_nat64_ptr_query(self, name: dns.name.Name) -> str | None:
-        """
-        Check if this is a PTR query for an IPv6 address that matches our DNS64 prefix.
-        Returns the embedded IPv4 address if it matches, None otherwise.
-        """
-        labels = [x.decode().lower() for x in name.labels if x]
-
-        # PTR queries for IPv6 are in ip6.arpa format
-        if len(labels) < 34 or labels[-2:] != ['ip6', 'arpa']:
-            return None
-
-        # Extract the 32 hex digits (each label is one hex digit)
-        hex_digits = labels[-34:-2]  # Skip 'ip6.arpa'
-        if len(hex_digits) != 32:
-            return None
-
-        try:
-            # Reverse the order and join to form IPv6 address
-            hex_str = ''.join(reversed(hex_digits))
-            # Insert colons every 4 characters
-            ipv6_str = ':'.join(hex_str[i:i+4] for i in range(0, 32, 4))
-            ipv6_addr = ipaddress.IPv6Address(ipv6_str)
-
-            # Check if this IPv6 address starts with our DNS64 prefix
-            prefix_addr = ipaddress.IPv6Address(self._dns64_prefix + '0.0.0.0')
-            prefix_network = ipaddress.IPv6Network(f"{prefix_addr}/{96}")
-
-            if ipv6_addr in prefix_network:
-                # Extract the last 32 bits as IPv4 address
-                ipv4_int = int(ipv6_addr) & 0xFFFFFFFF
-                ipv4_addr = ipaddress.IPv4Address(ipv4_int)
-                return str(ipv4_addr)
-
-        except (ValueError, ipaddress.AddressValueError):
-            pass
-
-        return None
 
     async def _query_global_a_cached(self, domain: dns.name.Name, policy: DomainPolicy) -> \
               tuple[dns.message.Message, bool]:
@@ -267,7 +273,7 @@ class Server:
         for ans in resp.answer:
             if ans.rdclass == dns.rdataclass.IN \
                and ans.rdtype in (dns.rdatatype.A, dns.rdatatype.AAAA) \
-               and any(self._is_cn_ip(x.address) for x in ans):
+               and any(_is_cn_ip(x.address) for x in ans):
                 has_cn_ip = True
         has_cn_ip = await self._has_cn_ip_answer_domain_cache.get_or_set(domain, has_cn_ip)
         return (resp, has_cn_ip)
@@ -278,7 +284,7 @@ class Server:
         '''
         policy = self._get_domain_policy(question.name)
 
-        if self._is_nat64_domain(question.name) or policy.is_known_global_domain():
+        if _is_nat64_domain(question.name) or policy.is_known_global_domain():
             return []
 
         if policy.is_known_cn_domain():
@@ -298,7 +304,7 @@ class Server:
 
     async def _handle_query_aaaa(self, question: dns.rrset.RRset) -> list[dns.rrset.RRset]:
         # Check if this is a nat64 domain (e.g., 1.2.3.4.nat64)
-        if ipv4_addr := self._is_nat64_domain(question.name):
+        if ipv4_addr := _is_nat64_domain(question.name):
             # Create synthetic AAAA record with DNS64 prefix + IPv4 address
             dns64_ans = dns.rrset.from_rdata_list(
                 question.name, 300,  # 5 minute TTL
@@ -348,7 +354,7 @@ class Server:
         Handle PTR queries, including synthetic responses for nat64 domains.
         """
         # Check if this is a PTR query for a synthetic IPv6 address
-        if ipv4_addr := self._is_nat64_ptr_query(question.name):
+        if ipv4_addr := _is_nat64_ptr_query(question.name, self._dns64_prefix):
             # Create synthetic PTR record pointing to .nat64 domain
             nat64_domain = f"{ipv4_addr}.nat64."
             ptr_ans = dns.rrset.from_rdata_list(
