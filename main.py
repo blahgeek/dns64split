@@ -89,6 +89,15 @@ def _is_cn_ip(ip: str) -> bool:
         return False
 
 
+def _has_cn_ip(answer: list[dns.rrset.RRset]) -> bool:
+    for ans in answer:
+        if ans.rdclass == dns.rdataclass.IN \
+            and ans.rdtype in (dns.rdatatype.A, dns.rdatatype.AAAA) \
+            and any(_is_cn_ip(x.address) for x in ans):
+            return True
+    return False
+
+
 def _is_nat64_domain(name: dns.name.Name) -> str | None:
     """
     Check if domain is in format x.x.x.x.nat64 and return the IPv4 address if valid.
@@ -145,6 +154,51 @@ def _is_nat64_ptr_query(name: dns.name.Name, dns64_prefix: str) -> str | None:
         pass
 
     return None
+
+
+def _strip_cname(question_name: dns.name.Name, answer: list[dns.rrset.RRset]) -> list[dns.rrset.RRset]:
+    """
+    If the answer contains CNAME result for question_name and other result for the cname domain,
+    remove the CNAME answer and change other result's name to the question_name
+    """
+    # Find CNAME record for the question name
+    cname_target: dns.name.Name | None = None
+    for rrset in answer:
+        if (rrset.name == question_name and rrset.rdtype == dns.rdatatype.CNAME):
+            # Get the CNAME target
+            if len(rrset) > 0:
+                cname_target = rrset[0].target
+            break
+
+    # Remove CNAME and rename target records to question name
+    result = []
+    for rrset in answer:
+        if rrset.rdtype == dns.rdatatype.CNAME:
+            # Skip the CNAME record
+            continue
+        elif rrset.name == cname_target:
+            # Rename target records to question name
+            new_rrset = dns.rrset.RRset(question_name, rrset.rdclass, rrset.rdtype, rrset.covers)
+            new_rrset.ttl = rrset.ttl
+            for rdata in rrset:
+                new_rrset.add(rdata)
+            result.append(new_rrset)
+        elif rrset.name == question_name:
+            # Keep other records as-is, only if it's for the question
+            result.append(rrset)
+
+    return result
+
+
+def _map_rr(fn: tp.Callable[[dns.rdata.Rdata], dns.rdata.Rdata | None], answers: list[dns.rrset.RRset]) -> list[dns.rrset.RRset]:
+    final_answers: list[dns.rrset.RRset] = []
+    for rrset in answers:
+        final_rrset = dns.rrset.RRset(rrset.name, rrset.rdclass, rrset.rdtype, rrset.covers)
+        for rr in rrset:
+            if final_rr := fn(rr):
+                final_rrset.add(final_rr)
+                final_answers.append(final_rrset)
+    return final_answers
 
 
 TP_K = tp.TypeVar('TP_K')
@@ -220,19 +274,15 @@ class CacheMap(tp.Generic[TP_K, TP_V]):
         return result
 
 
+class DualStackResult(tp.NamedTuple):
+    a: list[dns.rrset.RRset]
+    aaaa: list[dns.rrset.RRset]
+
 
 class Server:
     def __init__(self, *, dns64_prefix: str, config_path: str | None):
         self._domain_policies = _parse_domain_policies_from_config(config_path)
-        # The result of "_has_cn_ip_answer" for a domain should be cached
-        # because it needs to be consistant.
-        # If, during an A query, the domain is treated as non-CN-ip-answer-domain,
-        # and during an AAAA query, the domain is treated as yes,
-        # then both responses would be empty.
-        self._has_cn_ip_answer_domain_cache: CacheMap[dns.name.Name, bool] = \
-            CacheMap(max_cache_size=16 * 1024, max_cache_duration=24 * 3600)
-
-        self._global_a_query_cache: CacheMap[dns.name.Name, dns.message.Message] = \
+        self._resolve_dual_stack_cache: CacheMap[dns.name.Name, DualStackResult] = \
             CacheMap(max_cache_duration=30)
 
         self._dns64_prefix = dns64_prefix
@@ -256,85 +306,59 @@ class Server:
                 return res
         return DomainPolicy()
 
+    async def _resolve_dual_stack_cached(self, name: dns.name.Name) -> DualStackResult:
+        return await self._resolve_dual_stack_cache.get_or_set_by_fn(name, lambda: self._resolve_dual_stack(name))
 
-
-
-    async def _query_global_a_cached(self, domain: dns.name.Name, policy: DomainPolicy) -> \
-              tuple[dns.message.Message, bool]:
+    async def _resolve_dual_stack(self, name: dns.name.Name) -> DualStackResult:
         """
-        Return result, and has_cn_ip_answer
+        Resolve A and AAAA for domain at once.
         """
-        resp = await self._global_a_query_cache.get_or_set_by_fn(
-            domain,
-            lambda: dns.asyncquery.udp(dns.message.make_query(domain, dns.rdatatype.A),
-                                       policy.upstream or self._global_upstream_v4),
-        )
-        has_cn_ip = False
-        for ans in resp.answer:
-            if ans.rdclass == dns.rdataclass.IN \
-               and ans.rdtype in (dns.rdatatype.A, dns.rdatatype.AAAA) \
-               and any(_is_cn_ip(x.address) for x in ans):
-                has_cn_ip = True
-        has_cn_ip = await self._has_cn_ip_answer_domain_cache.get_or_set(domain, has_cn_ip)
-        return (resp, has_cn_ip)
+        policy = self._get_domain_policy(name)
 
-    async def _handle_query_a(self, question: dns.rrset.RRset) -> list[dns.rrset.RRset]:
-        '''
-        Return A response as-is only if it's from CN
-        '''
-        policy = self._get_domain_policy(question.name)
-
-        if _is_nat64_domain(question.name) or policy.is_known_global_domain():
-            return []
-
-        if policy.is_known_cn_domain():
-            resp = await dns.asyncquery.udp(
-                dns.message.make_query(question.name, dns.rdatatype.A),
-                policy.upstream or self._cn_upstream
-            )
-            return resp.answer
-
-        resp, has_cn_ip = await self._query_global_a_cached(question.name, policy)
-        if has_cn_ip:
-            return resp.answer
-        # hack: sleep for a short period of time before returning empty result
-        # hopefully resolve an issue (firefox bug?) where NXDOMAIN error is shown in firefox
-        await asyncio.sleep(0.1)
-        return []
-
-    async def _handle_query_aaaa(self, question: dns.rrset.RRset) -> list[dns.rrset.RRset]:
         # Check if this is a nat64 domain (e.g., 1.2.3.4.nat64)
-        if ipv4_addr := _is_nat64_domain(question.name):
+        if ipv4_addr := _is_nat64_domain(name):
             # Create synthetic AAAA record with DNS64 prefix + IPv4 address
             dns64_ans = dns.rrset.from_rdata_list(
-                question.name, 300,  # 5 minute TTL
+                name, 300,  # 5 minute TTL
                 [dns.rdtypes.IN.AAAA.AAAA(
                     dns.rdataclass.IN, dns.rdatatype.AAAA,
                     self._dns64_prefix + ipv4_addr,
                 )])
-            return [dns64_ans]
+            return DualStackResult(a=[], aaaa=[dns64_ans])
 
-        policy = self._get_domain_policy(question.name)
+        # is_known_cn, forward to cn upstream
         if policy.is_known_cn_domain():
-            return []
+            resp = await dns.asyncquery.udp(
+                dns.message.make_query(name, dns.rdatatype.A),
+                policy.upstream or self._cn_upstream
+            )
+            return DualStackResult(a=resp.answer, aaaa=[])
 
-        (a_resp, has_cn_ip), aaaa_resp = await asyncio.gather(
-            self._query_global_a_cached(question.name, policy),
+        a_resp, aaaa_resp = await asyncio.gather(
             dns.asyncquery.udp(
-                dns.message.make_query(question.name, dns.rdatatype.AAAA),
+                dns.message.make_query(name, dns.rdatatype.A),
+                policy.upstream or self._global_upstream_v4,
+            ),
+            dns.asyncquery.udp(
+                dns.message.make_query(name, dns.rdatatype.AAAA),
                 policy.upstream or self._global_upstream_v6,
             ),
         )
+        # guessed is cn, return ipv4 result
+        is_cn = not policy.is_known_global_domain() and _has_cn_ip(a_resp.answer)
+        if is_cn:
+            return DualStackResult(a=a_resp.answer, aaaa=[])
 
-        if not policy.is_known_global_domain() and has_cn_ip:
-            return []
+        # global:
 
+        # return native ipv6 if exists
         if not policy.ignore_native_ipv6 and \
            any(ans.rdclass == dns.rdataclass.IN and ans.rdtype == dns.rdatatype.AAAA
                and any(x.address != '::' for x in ans)
                for ans in aaaa_resp.answer):
-            return aaaa_resp.answer
+            return DualStackResult(a=[], aaaa=aaaa_resp.answer)
 
+        # return nat64 result
         result: list[dns.rrset.RRset] = []
         for ans in a_resp.answer:
             if ans.rdclass == dns.rdataclass.IN and ans.rdtype == dns.rdatatype.A:
@@ -347,7 +371,15 @@ class Server:
                 result.append(dns64_ans)
             else:
                 result.append(ans)
-        return result
+        return DualStackResult(a=[], aaaa=result)
+
+    async def _handle_query_a(self, question: dns.rrset.RRset) -> list[dns.rrset.RRset]:
+        result = await self._resolve_dual_stack_cached(question.name)
+        return _strip_cname(question.name, result.a)
+
+    async def _handle_query_aaaa(self, question: dns.rrset.RRset) -> list[dns.rrset.RRset]:
+        result = await self._resolve_dual_stack_cached(question.name)
+        return _strip_cname(question.name, result.aaaa)
 
     async def _handle_query_ptr(self, question: dns.rrset.RRset) -> list[dns.rrset.RRset]:
         """
@@ -372,52 +404,50 @@ class Server:
         )
         return resp.answer
 
-    def _filter_special_answer_rr(self, rr: dns.rdata.Rdata) -> dns.rdata.Rdata | None:
-        if rr.rdclass == dns.rdataclass.IN and rr.rdtype == dns.rdatatype.HTTPS:
-            # Remove ipv4hint and ipv6hint from HTTPS answers
-            rr = tp.cast(dns.rdtypes.IN.HTTPS.HTTPS, rr)
-            return dns.rdtypes.IN.HTTPS.HTTPS(
-                rr.rdclass, rr.rdtype,
-                priority=rr.priority,
-                target=rr.target,
-                params=dict(kv for kv in rr.params.items()
-                            if kv[0] not in (dns.rdtypes.svcbbase.ParamKey.IPV4HINT,
-                                             dns.rdtypes.svcbbase.ParamKey.IPV6HINT))
-            )
-        return rr
-
-    def _filter_special_answer(self, answers: list[dns.rrset.RRset]) -> list[dns.rrset.RRset]:
-        '''
-        Filter answers that is not A or AAAA.
-        '''
-        final_answers: list[dns.rrset.RRset] = []
-        for rrset in answers:
-            final_rrset = dns.rrset.RRset(rrset.name, rrset.rdclass, rrset.rdtype, rrset.covers)
-            for rr in rrset:
-                if final_rr := self._filter_special_answer_rr(rr):
-                    final_rrset.add(final_rr)
-                    final_answers.append(final_rrset)
-        return final_answers
+    async def _handle_query_https(self, question: dns.rrset.RRset) -> list[dns.rrset.RRset]:
+        upstream_response = await dns.asyncquery.udp(
+            dns.message.make_query(question.name, dns.rdatatype.HTTPS),
+            self._global_upstream_v4,
+        )
+        def _remove_address(rr: dns.rdata.Rdata) -> dns.rdata.Rdata:
+            if rr.rdclass == dns.rdataclass.IN and rr.rdtype == dns.rdatatype.HTTPS:
+                # Remove ipv4hint and ipv6hint from HTTPS answers
+                rr = tp.cast(dns.rdtypes.IN.HTTPS.HTTPS, rr)
+                return dns.rdtypes.IN.HTTPS.HTTPS(
+                    rr.rdclass, rr.rdtype,
+                    priority=rr.priority,
+                    target=rr.target,
+                    params=dict(kv for kv in rr.params.items()
+                                if kv[0] not in (dns.rdtypes.svcbbase.ParamKey.IPV4HINT,
+                                                dns.rdtypes.svcbbase.ParamKey.IPV6HINT))
+                )
+            return rr
+        result = _map_rr(_remove_address, upstream_response.answer)
+        return _strip_cname(question.name, result)
 
     async def _handle_query(self, request: dns.message.Message) -> dns.message.Message:
         question = request.question[0]
         logger.debug(f'Handling question {question}, domain policy {self._get_domain_policy(question.name)}')
 
-        # Handle special record types (A, AAAA, PTR) for IN class
-        if question.rdclass == dns.rdataclass.IN and question.rdtype in (dns.rdatatype.A, dns.rdatatype.AAAA, dns.rdatatype.PTR):
-            response = dns.message.make_response(request, recursion_available=True)
+        # Handle special record types
+        answers: list[dns.rrset.RRset] | None = None
+        if question.rdclass == dns.rdataclass.IN:
             if question.rdtype == dns.rdatatype.A:
-                response.answer = await self._handle_query_a(question)
+                answers = await self._handle_query_a(question)
             elif question.rdtype == dns.rdatatype.AAAA:
-                response.answer = await self._handle_query_aaaa(question)
+                answers = await self._handle_query_aaaa(question)
             elif question.rdtype == dns.rdatatype.PTR:
-                response.answer = await self._handle_query_ptr(question)
+                answers = await self._handle_query_ptr(question)
+            elif question.rdtype == dns.rdatatype.HTTPS:
+                answers = await self._handle_query_https(question)
+
+        if answers is not None:
+            response = dns.message.make_response(request, recursion_available=True)
+            response.answer = answers
             return response
 
         # Forward all other queries to upstream
-        response = await dns.asyncquery.udp(request, self._global_upstream_v4)
-        response.answer = self._filter_special_answer(response.answer)
-        return response
+        return await dns.asyncquery.udp(request, self._global_upstream_v4)
 
     async def handle_query(self, request: dns.message.Message) -> dns.message.Message:
         try:
